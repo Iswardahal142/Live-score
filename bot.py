@@ -15,9 +15,17 @@ CB_BASE     = "https://www.cricbuzz.com/api/cricket-match"
 CB_LIVE_URL = "https://www.cricbuzz.com/api/cricket-match/live-matches"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-    "Accept": "application/json",
-    "Referer": "https://www.cricbuzz.com/",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-IN,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.cricbuzz.com/cricket-match/live-scores",
+    "Origin": "https://www.cricbuzz.com",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "x-pitchvision-client": "cricbuzz-webapp",
 }
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -31,9 +39,15 @@ watched: dict[int, dict[str, dict]] = {}
 # ── Cricbuzz Fetchers ──────────────────────────────────────────────────────────
 
 async def fetch_live_matches() -> list[dict]:
+    import json
     async with aiohttp.ClientSession(headers=HEADERS) as s:
-        async with s.get(CB_LIVE_URL, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            data = await r.json(content_type=None)
+        async with s.get(CB_LIVE_URL, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                raise Exception(f"Cricbuzz ne {r.status} diya. Thodi der baad try karo.")
+            text = await r.text()
+            if not text or not text.strip().startswith("{"):
+                raise Exception("Cricbuzz blocked kar raha hai. 2-3 min baad /live try karo.")
+            data = json.loads(text)
             matches = []
             for type_group in data.get("typeMatches", []):
                 for series in type_group.get("seriesMatches", []):
@@ -45,12 +59,16 @@ async def fetch_live_matches() -> list[dict]:
 
 
 async def fetch_scorecard(match_id: str) -> dict | None:
+    import json
     url = f"{CB_BASE}/{match_id}/full-scorecard"
     async with aiohttp.ClientSession(headers=HEADERS) as s:
-        async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
             if r.status != 200:
                 return None
-            return await r.json(content_type=None)
+            text = await r.text()
+            if not text or not text.strip().startswith("{"):
+                return None
+            return json.loads(text)
 
 
 # ── Formatters ─────────────────────────────────────────────────────────────────
