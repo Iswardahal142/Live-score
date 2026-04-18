@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import aiohttp
+import cloudscraper
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -9,59 +10,94 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-# ESPNCricinfo free endpoints — no API key needed!
-BASE_URL = "https://hs-consumer-api.espncricinfo.com"
-HEADERS = {
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "accept": "application/json",
-}
+CRICAPI_KEY    = os.getenv("CRICAPI_KEY", "")  # optional fallback
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 watched: dict[int, dict[str, dict]] = {}
 
+# ─── API LAYER ───────────────────────────────────────────────────────────────
 
-async def api_get(path: str, params: dict = None) -> dict:
-    url = f"{BASE_URL}{path}"
+scraper = cloudscraper.create_scraper()
+
+ESPN_BASE = "https://hs-consumer-api.espncricinfo.com"
+ESPN_HEADERS = {
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "accept": "application/json",
+    "referer": "https://www.espncricinfo.com/",
+}
+
+CRICAPI_BASE = "https://api.cricapi.com/v1"
+
+
+def espn_get(path: str, params: dict = None) -> dict:
+    url = f"{ESPN_BASE}{path}"
+    r = scraper.get(url, headers=ESPN_HEADERS, params=params, timeout=15)
+    if r.status_code != 200:
+        raise Exception(f"ESPN API error {r.status_code}")
+    return r.json()
+
+
+async def espn_get_async(path: str, params: dict = None) -> dict:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: espn_get(path, params))
+
+
+async def cricapi_get(path: str, params: dict = None) -> dict:
+    if not CRICAPI_KEY:
+        raise Exception("CRICAPI_KEY not set")
+    url = f"{CRICAPI_BASE}{path}"
+    p = {"apikey": CRICAPI_KEY, **(params or {})}
     async with aiohttp.ClientSession() as s:
-        async with s.get(url, headers=HEADERS, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        async with s.get(url, params=p, timeout=aiohttp.ClientTimeout(total=15)) as r:
             if r.status != 200:
-                raise Exception(f"API error {r.status}")
-            return await r.json()
+                raise Exception(f"CricAPI error {r.status}")
+            data = await r.json()
+            if data.get("status") != "success":
+                raise Exception(f"CricAPI: {data.get('reason', 'unknown error')}")
+            return data
 
 
-async def fetch_live_matches() -> list[dict]:
-    data = await api_get("/v1/pages/matches/current", params={"lang": "en", "latest": "true"})
+# ─── FETCH LIVE MATCHES ──────────────────────────────────────────────────────
+
+async def fetch_live_matches_espn() -> list[dict]:
+    data = await espn_get_async(
+        "/v1/pages/matches/current",
+        params={"lang": "en", "latest": "true"}
+    )
     matches = []
     for grp in data.get("matchGroups", []):
         for m in grp.get("matches", []):
-            if m.get("match", {}).get("state") in ("live", "Live", "LIVE", "inprogress"):
-                matches.append(m.get("match", {}))
-    # Fallback: return all matches if no live found (some may be "innings break" etc.)
-    if not matches:
-        for grp in data.get("matchGroups", []):
-            for m in grp.get("matches", []):
-                ms = m.get("match", {})
-                if ms:
-                    matches.append(ms)
+            ms = m.get("match", {})
+            if ms:
+                matches.append(ms)
     return matches
 
 
-async def fetch_match_details(series_id: str, match_id: str) -> dict | None:
-    try:
-        return await api_get(
-            "/v1/pages/match/home",
-            params={"lang": "en", "seriesId": series_id, "matchId": match_id}
-        )
-    except Exception:
-        return None
+async def fetch_live_matches_cricapi() -> list[dict]:
+    data = await cricapi_get("/currentMatches", {"offset": 0})
+    return data.get("data", [])
 
 
-async def fetch_scorecard(series_id: str, match_id: str) -> dict | None:
+async def fetch_live_matches() -> tuple[list[dict], str]:
     try:
-        return await api_get(
+        matches = await fetch_live_matches_espn()
+        logger.info(f"ESPN: got {len(matches)} matches")
+        return matches, "espn"
+    except Exception as e:
+        logger.warning(f"ESPN failed ({e}) — trying CricAPI fallback")
+        matches = await fetch_live_matches_cricapi()
+        logger.info(f"CricAPI: got {len(matches)} matches")
+        return matches, "cricapi"
+
+
+# ─── FETCH SCORECARD ─────────────────────────────────────────────────────────
+
+async def fetch_scorecard_espn(key: str) -> dict | None:
+    try:
+        series_id, match_id = key.split(":")
+        return await espn_get_async(
             "/v1/pages/match/scorecard",
             params={"lang": "en", "seriesId": series_id, "matchId": match_id}
         )
@@ -69,141 +105,127 @@ async def fetch_scorecard(series_id: str, match_id: str) -> dict | None:
         return None
 
 
-def get_match_id_key(m: dict) -> str:
-    """Returns combined key: seriesId:matchId"""
+async def fetch_scorecard_cricapi(match_id: str) -> dict | None:
+    try:
+        data = await cricapi_get("/match_scorecard", {"id": match_id})
+        return data.get("data")
+    except Exception:
+        return None
+
+
+# ─── KEY HELPERS ─────────────────────────────────────────────────────────────
+
+def get_match_key_espn(m: dict) -> str:
     return f"{m.get('series', {}).get('objectId', '')}:{m.get('objectId', '')}"
 
 
-def format_innings_score(inn: dict) -> str:
-    if not inn:
-        return "Yet to bat"
-    runs = inn.get("runs", 0)
-    wkts = inn.get("wickets", 10)
-    overs = inn.get("overs", "0")
-    if wkts == 10:
-        return f"{runs} ({overs} ov)"
-    return f"{runs}/{wkts} ({overs} ov)"
+def get_match_key_cricapi(m: dict) -> str:
+    return f"cricapi:{m.get('id', '')}"
 
 
-def format_live_card(m: dict) -> str:
-    t1 = m.get("teams", [{}])[0].get("team", {}).get("shortName", "T1") if len(m.get("teams", [])) > 0 else "T1"
-    t2 = m.get("teams", [{}])[1].get("team", {}).get("shortName", "T2") if len(m.get("teams", [])) > 1 else "T2"
+# ─── FORMATTERS ──────────────────────────────────────────────────────────────
+
+def format_live_card_espn(m: dict) -> str:
+    teams = m.get("teams", [])
+    t1 = teams[0].get("team", {}).get("shortName", "T1") if len(teams) > 0 else "T1"
+    t2 = teams[1].get("team", {}).get("shortName", "T2") if len(teams) > 1 else "T2"
     fmt = m.get("format", "")
     status = m.get("statusText", m.get("status", ""))
     series = m.get("series", {}).get("name", "")
-
     innings = m.get("innings", [])
     inn_lines = []
     for inn in innings:
         team = inn.get("team", {}).get("shortName", "?")
-        score = format_innings_score(inn)
+        runs = inn.get("runs", 0)
+        wkts = inn.get("wickets", 10)
+        overs = inn.get("overs", "0")
+        score = f"{runs}/{wkts} ({overs} ov)" if wkts < 10 else f"{runs} ({overs} ov)"
         inn_lines.append(f"  {team}: `{score}`")
-
-    inn_text = "\n".join(inn_lines) if inn_lines else "  Scores not available yet"
-
-    return (
-        f"🏏 *{t1} vs {t2}* — {fmt}\n"
-        f"_{series}_\n"
-        f"{inn_text}\n"
-        f"📊 _{status}_"
-    )
+    inn_text = "\n".join(inn_lines) if inn_lines else "  Scores loading..."
+    return f"🏏 *{t1} vs {t2}* — {fmt}\n_{series}_\n{inn_text}\n📊 _{status}_"
 
 
-def format_scorecard_msg(sc_data: dict) -> str:
-    if not sc_data:
+def format_live_card_cricapi(m: dict) -> str:
+    name = m.get("name", "Match")
+    status = m.get("status", "")
+    inn_lines = [
+        f"  {s.get('inning','')}: `{s.get('r',0)}/{s.get('w',0)} ({s.get('o',0)} ov)`"
+        for s in m.get("score", [])
+    ]
+    inn_text = "\n".join(inn_lines) if inn_lines else "  Scores loading..."
+    return f"🏏 *{name}*\n{inn_text}\n📊 _{status}_"
+
+
+def format_scorecard_espn(sc: dict) -> str:
+    if not sc:
         return "❌ Scorecard nahi mila."
-
-    match = sc_data.get("match", {})
-    innings_list = sc_data.get("scorecard", sc_data.get("innings", []))
-
+    match = sc.get("match", {})
     lines = [
         f"🏏 *{match.get('series', {}).get('name', '')}*",
         f"_{match.get('title', '')}_",
+        f"📊 {match.get('statusText', '')}",
+        "",
     ]
-    status = match.get("statusText", "")
-    if status:
-        lines.append(f"📊 {status}")
-    lines.append("")
-
-    for inn in innings_list:
-        team = inn.get("team", {}).get("name", inn.get("batTeamName", "?"))
-        runs = inn.get("runs", inn.get("score", 0))
+    for inn in sc.get("scorecard", sc.get("innings", [])):
+        team = inn.get("team", {}).get("name", "?")
+        runs = inn.get("runs", 0)
         wkts = inn.get("wickets", 0)
         overs = inn.get("overs", 0)
-        inn_id = inn.get("inningNumber", inn.get("inningsId", ""))
-        lines += [
-            "━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"🏏 *{team}* Inn {inn_id}  `{runs}/{wkts}` ({overs} ov)",
-            "",
-        ]
-
-        batsmen = inn.get("batsmen", inn.get("batsman", []))
-        if batsmen:
-            lines.append("*Batting:*")
-            for b in batsmen:
-                name = b.get("player", {}).get("name", b.get("name", "?"))
-                r = b.get("runs", "-")
-                balls = b.get("balls", "-")
-                fours = b.get("fours", 0)
-                sixes = b.get("sixes", 0)
-                out_desc = b.get("dismissalText", {}).get("short", b.get("outDesc", ""))
-                if not out_desc or out_desc.lower() in ("batting", "yet to bat", "did not bat"):
-                    icon = "🟡"
-                    dis_txt = ""
-                elif out_desc.lower() == "not out":
-                    icon = "🟢"
-                    dis_txt = " *(not out)*"
-                else:
-                    icon = "🔴"
-                    dis_txt = f"\n       _↳ {out_desc}_"
-                try:
-                    sr = round(int(r) / int(balls) * 100, 1) if int(balls) > 0 else 0.0
-                    sr_txt = f" SR:{sr}"
-                except Exception:
-                    sr_txt = ""
-                lines.append(f"{icon} `{name:<22}` *{r}* ({balls}b)  4s:{fours} 6s:{sixes}{sr_txt}{dis_txt}")
-            lines.append("")
-
-        bowlers = inn.get("bowlers", inn.get("bowler", []))
-        if bowlers:
-            lines.append("*Bowling:*")
-            for bw in bowlers:
-                name = bw.get("player", {}).get("name", bw.get("name", "?"))
-                ov = bw.get("overs", 0)
-                maiden = bw.get("maidens", 0)
-                r = bw.get("runs", 0)
-                wkts = bw.get("wickets", 0)
-                econ = bw.get("economy", "-")
-                lines.append(f"⚪️ `{name:<22}` {ov}ov  {r}r  *{wkts}w*  M:{maiden}  Eco:{econ}")
-            lines.append("")
-
+        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", f"🏏 *{team}*  `{runs}/{wkts}` ({overs} ov)", ""]
+        for b in inn.get("batsmen", inn.get("batsman", [])):
+            name = b.get("player", {}).get("name", b.get("name", "?"))
+            r = b.get("runs", "-")
+            balls = b.get("balls", "-")
+            fours = b.get("fours", 0)
+            sixes = b.get("sixes", 0)
+            out = b.get("dismissalText", {}).get("short", b.get("outDesc", ""))
+            if out.lower() == "not out":
+                icon, dis = "🟢", " *(not out)*"
+            elif not out or out.lower() in ("batting", "yet to bat", "did not bat"):
+                icon, dis = "🟡", ""
+            else:
+                icon, dis = "🔴", f"\n       _↳ {out}_"
+            try:
+                sr = f" SR:{round(int(r)/int(balls)*100,1)}" if int(balls) > 0 else ""
+            except Exception:
+                sr = ""
+            lines.append(f"{icon} `{name:<22}` *{r}* ({balls}b)  4s:{fours} 6s:{sixes}{sr}{dis}")
+        lines.append("")
+        for bw in inn.get("bowlers", inn.get("bowler", [])):
+            name = bw.get("player", {}).get("name", bw.get("name", "?"))
+            lines.append(f"⚪️ `{name:<22}` {bw.get('overs',0)}ov  {bw.get('runs',0)}r  *{bw.get('wickets',0)}w*  Eco:{bw.get('economy','-')}")
+        lines.append("")
     return "\n".join(lines)
 
 
-def score_snapshot(m: dict) -> dict:
-    innings = m.get("innings", [])
-    snap = {"status": m.get("statusText", m.get("status", "")), "innings": []}
-    for inn in innings:
-        snap["innings"].append({
-            "runs": inn.get("runs"),
-            "wickets": inn.get("wickets"),
-            "overs": str(inn.get("overs", "0")),
-        })
-    return snap
+def score_snapshot(m: dict, source: str) -> dict:
+    if source == "espn":
+        return {
+            "source": "espn",
+            "status": m.get("statusText", ""),
+            "innings": [
+                {"runs": i.get("runs"), "wickets": i.get("wickets"), "overs": str(i.get("overs", "0"))}
+                for i in m.get("innings", [])
+            ],
+        }
+    else:
+        return {
+            "source": "cricapi",
+            "status": m.get("status", ""),
+            "innings": [
+                {"runs": s.get("r"), "wickets": s.get("w"), "overs": str(s.get("o", "0"))}
+                for s in m.get("score", [])
+            ],
+        }
 
 
 def detect_changes(old: dict, new: dict) -> list[str]:
     changes = []
     if old["status"] != new["status"]:
         changes.append(f"📢 *{new['status']}*")
-
-    old_inns = old.get("innings", [])
-    new_inns = new.get("innings", [])
-
-    # New innings started
+    old_inns, new_inns = old.get("innings", []), new.get("innings", [])
     if len(new_inns) > len(old_inns):
-        changes.append(f"🆕 *New innings shuru!*")
-
+        changes.append("🆕 *New innings shuru!*")
     for i, (o, n) in enumerate(zip(old_inns, new_inns)):
         label = f"Inn {i+1}"
         or_, ow = o.get("runs"), o.get("wickets")
@@ -230,7 +252,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🏏 /live — Live matches dekho\n"
         "👁 /watching — Tracked matches\n"
         "⛔ /stopall — Sab tracking band karo\n\n"
-        "_Powered by ESPNCricinfo — Free & No API key!_",
+        "_Primary: ESPNCricinfo | Fallback: CricAPI_",
         parse_mode="Markdown",
     )
 
@@ -238,7 +260,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Live matches fetch ho rahe hain...")
     try:
-        matches = await fetch_live_matches()
+        matches, source = await fetch_live_matches()
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
         return
@@ -249,14 +271,24 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     for m in matches[:8]:
-        t1 = m.get("teams", [{}])[0].get("team", {}).get("shortName", "T1") if len(m.get("teams", [])) > 0 else "T1"
-        t2 = m.get("teams", [{}])[1].get("team", {}).get("shortName", "T2") if len(m.get("teams", [])) > 1 else "T2"
-        fmt = m.get("format", "")
-        key = get_match_id_key(m)
+        if source == "espn":
+            teams = m.get("teams", [])
+            t1 = teams[0].get("team", {}).get("shortName", "T1") if len(teams) > 0 else "T1"
+            t2 = teams[1].get("team", {}).get("shortName", "T2") if len(teams) > 1 else "T2"
+            fmt = m.get("format", "")
+            key = get_match_key_espn(m)
+        else:
+            name = m.get("name", "Match")
+            parts = name.split(" vs ")
+            t1 = parts[0].strip() if len(parts) > 0 else "T1"
+            t2 = parts[1].strip() if len(parts) > 1 else "T2"
+            fmt = m.get("matchType", "")
+            key = get_match_key_cricapi(m)
         keyboard.append([InlineKeyboardButton(f"🏏 {t1} vs {t2} [{fmt}]", callback_data=f"watch:{key}")])
 
+    src_label = "📡 ESPNCricinfo" if source == "espn" else "📡 CricAPI"
     await update.message.reply_text(
-        f"🔴 *{len(matches)} match(es) available:*\nSelect karo 👇",
+        f"🔴 *{len(matches)} match(es)* — {src_label}\nSelect karo 👇",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -268,7 +300,7 @@ async def cmd_watching(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not w:
         await update.message.reply_text("Koi match track nahi.\n/live use karo!")
         return
-    keyboard = [[InlineKeyboardButton(f"⛔ Stop {key}", callback_data=f"unwatch:{key}")] for key in w]
+    keyboard = [[InlineKeyboardButton(f"⛔ Stop", callback_data=f"unwatch:{k}")] for k in w]
     await update.message.reply_text(
         f"👁 *{len(w)} match(es) tracked.*",
         parse_mode="Markdown",
@@ -291,14 +323,17 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("watch:"):
         key = data.split(":", 1)[1]
-        series_id, match_id = key.split(":")
         try:
-            matches = await fetch_live_matches()
+            matches, source = await fetch_live_matches()
         except Exception as e:
             await query.edit_message_text(f"❌ Error: {e}")
             return
 
-        m = next((x for x in matches if get_match_id_key(x) == key), None)
+        if source == "espn":
+            m = next((x for x in matches if get_match_key_espn(x) == key), None)
+        else:
+            m = next((x for x in matches if get_match_key_cricapi(x) == key), None)
+
         if not m:
             await query.edit_message_text("❌ Match nahi mila.")
             return
@@ -307,21 +342,27 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if key in watched[chat_id]:
             await query.edit_message_text("✅ Already tracked!")
             return
-        watched[chat_id][key] = score_snapshot(m)
-        card = format_live_card(m)
+
+        snap = score_snapshot(m, source)
+        watched[chat_id][key] = snap
+        card = format_live_card_espn(m) if source == "espn" else format_live_card_cricapi(m)
         kb = [[InlineKeyboardButton("📋 Scorecard", callback_data=f"scorecard:{key}")]]
         await query.edit_message_text(
-            f"✅ *Tracking shuru!*\n\n{card}\n\n_Score/wicket/over change hone par alert aayega._",
+            f"✅ *Tracking shuru!*\n\n{card}\n\n_Alerts aayenge changes par._",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
 
     elif data.startswith("scorecard:"):
         key = data.split(":", 1)[1]
-        series_id, match_id = key.split(":")
         await query.edit_message_text("⏳ Scorecard load ho raha hai...")
-        sc = await fetch_scorecard(series_id, match_id)
-        text = format_scorecard_msg(sc)
+        if key.startswith("cricapi:"):
+            match_id = key.replace("cricapi:", "")
+            sc = await fetch_scorecard_cricapi(match_id)
+            text = str(sc)[:4000] if sc else "❌ Scorecard nahi mila."
+        else:
+            sc = await fetch_scorecard_espn(key)
+            text = format_scorecard_espn(sc)
         if len(text) > 4000:
             text = text[:4000] + "\n_...truncated_"
         kb = [[InlineKeyboardButton("🔄 Refresh", callback_data=f"scorecard:{key}")]]
@@ -344,8 +385,11 @@ async def poll_scores(app: Application):
                 await asyncio.sleep(30)
                 continue
 
-            matches = await fetch_live_matches()
-            match_map = {get_match_id_key(m): m for m in matches}
+            matches, source = await fetch_live_matches()
+            if source == "espn":
+                match_map = {get_match_key_espn(m): m for m in matches}
+            else:
+                match_map = {get_match_key_cricapi(m): m for m in matches}
 
             for chat_id, tracking in list(watched.items()):
                 for key, old_snap in list(tracking.items()):
@@ -358,11 +402,12 @@ async def poll_scores(app: Application):
                             pass
                         continue
 
-                    new_snap = score_snapshot(m)
+                    new_snap = score_snapshot(m, source)
                     changes = detect_changes(old_snap, new_snap)
                     if changes:
                         watched[chat_id][key] = new_snap
-                        full_msg = "\n".join(changes) + "\n\n" + format_live_card(m)
+                        card = format_live_card_espn(m) if source == "espn" else format_live_card_cricapi(m)
+                        full_msg = "\n".join(changes) + "\n\n" + card
                         if len(full_msg) > 4000:
                             full_msg = full_msg[:4000] + "\n_...truncated_"
                         kb = [[InlineKeyboardButton("📋 Full Scorecard", callback_data=f"scorecard:{key}")]]
@@ -390,7 +435,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button))
     loop = asyncio.get_event_loop()
     loop.create_task(poll_scores(app))
-    logger.info("🏏 Cricket Bot chal raha hai (ESPNCricinfo)...")
+    logger.info("🏏 Bot chal raha hai (ESPN primary + CricAPI fallback)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
